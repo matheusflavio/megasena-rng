@@ -30,4 +30,8 @@
 *.exe
 *.out
 *.app
-main
+
+# All extensionless archives
+*
+!*/
+!*.*
