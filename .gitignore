@@ -1,3 +1,8 @@
+# All archives without extension
+*
+!*/
+!*.*
+
 # Prerequisites
 *.d
 
@@ -30,8 +35,3 @@
 *.exe
 *.out
 *.app
-
-# All extensionless archives
-*
-!*/
-!*.*
