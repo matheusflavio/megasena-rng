@@ -7,7 +7,7 @@ all:
 	$(CC) $(CXXFLAGS) -o $(MAIN) $(MAIN).cpp
 
 clean:
-	@rm -rf $(TARGET)
+	@rm -rf $(MAIN)
 
 commit:
 	git add .
