@@ -14,9 +14,10 @@
 using namespace std;
 
 static const int TOTAL_COMBINACOES = 50063860;
-static const int ALVO_REPETICOES = 10;
+// Defina aqui a quantidade de reincidências desejada (ex: 60 ou mais)
+static const uint16_t ALVO_REPETICOES = 60; 
 
-// Tabela de Combinação pré-calculada para Mapeamento O(1)
+// Tabela de Combinação para Mapeamento O(1)
 int C[61][7];
 
 void inicializarCombinatoria() {
@@ -44,7 +45,7 @@ array<int, 6> indiceParaBilhete(int idx) {
     return bilhete;
 }
 
-// PRNG Xoroshiro128+ de altíssima velocidade
+// PRNG Xoroshiro128+
 struct Xoroshiro128Plus {
     uint64_t s[2];
     static inline uint64_t rotl(const uint64_t x, int k) {
@@ -64,22 +65,28 @@ struct Xoroshiro128Plus {
     }
 };
 
-// Gerenciador de Impressão Assíncrona (Produtor-Consumidor)
-class AsyncPrinter {
+// Gerenciador de Impressão com Backpressure (RAM Delimitada)
+class BoundedAsyncPrinter {
     queue<string> bufferQueue;
     mutex queueMutex;
-    condition_variable cv;
+    condition_variable cvConsumer;
+    condition_variable cvProducer;
+    size_t maxQueueSize;
     bool active = true;
     thread printThread;
 
     void processQueue() {
         while (true) {
             unique_lock<mutex> lock(queueMutex);
-            cv.wait(lock, [this] { return !bufferQueue.empty() || !active; });
+            cvConsumer.wait(lock, [this] { return !bufferQueue.empty() || !active; });
 
             while (!bufferQueue.empty()) {
                 string chunk = move(bufferQueue.front());
                 bufferQueue.pop();
+                
+                // Notifica as threads produtoras que abriu espaço na fila
+                cvProducer.notify_one();
+                
                 lock.unlock();
                 cout.write(chunk.data(), chunk.size());
                 lock.lock();
@@ -90,23 +97,29 @@ class AsyncPrinter {
     }
 
 public:
-    AsyncPrinter() : printThread(&AsyncPrinter::processQueue, this) {}
+    BoundedAsyncPrinter(size_t maxCapacity = 200) 
+        : maxQueueSize(maxCapacity), printThread(&BoundedAsyncPrinter::processQueue, this) {}
     
-    ~AsyncPrinter() {
+    ~BoundedAsyncPrinter() {
         {
             lock_guard<mutex> lock(queueMutex);
             active = false;
         }
-        cv.notify_one();
+        cvConsumer.notify_all();
+        cvProducer.notify_all();
         if (printThread.joinable()) printThread.join();
     }
 
     void push(string chunk) {
-        {
-            lock_guard<mutex> lock(queueMutex);
-            bufferQueue.push(move(chunk));
-        }
-        cv.notify_one();
+        unique_lock<mutex> lock(queueMutex);
+        
+        // Bloqueia as threads calculadoras se o terminal não estiver dando conta
+        cvProducer.wait(lock, [this] { return bufferQueue.size() < maxQueueSize || !active; });
+
+        if (!active) return;
+
+        bufferQueue.push(move(chunk));
+        cvConsumer.notify_one();
     }
 };
 
@@ -116,14 +129,16 @@ int main() {
 
     inicializarCombinatoria();
 
-    // Tabela única contínua de memória atômica compartilhada (47.7 MB)
-    vector<atomic<uint8_t>> historico(TOTAL_COMBINACOES);
+    // Suporta ate 65.535 repeticioes por combinação ocupando ~100.1 MB fixos de RAM
+    vector<atomic<uint16_t>> historico(TOTAL_COMBINACOES);
 
-    atomic<int> globalSorteios(0);
+    atomic<uint64_t> globalSorteios(0);
     atomic<bool> encontrado(false);
     atomic<int> idxVencedor(-1);
 
-    AsyncPrinter printer;
+    // Limite estrito de no maximo 200 blocos de texto mantidos em memoria
+    BoundedAsyncPrinter printer(200);
+
     unsigned int numThreads = thread::hardware_concurrency();
     if (numThreads == 0) numThreads = 4;
 
@@ -131,7 +146,6 @@ int main() {
 
     for (unsigned int t = 0; t < numThreads; ++t) {
         workers.emplace_back([&, t]() {
-            // Inicializador único por thread
             Xoroshiro128Plus rng;
             uint64_t seed = chrono::steady_clock::now().time_since_epoch().count() + t * 0x9E3779B97F4A7C15ULL;
             rng.s[0] = seed;
@@ -143,11 +157,10 @@ int main() {
             localBuffer.reserve(4096);
 
             while (!encontrado.load(memory_order_relaxed)) {
-                int idSorteio = globalSorteios.fetch_add(1, memory_order_relaxed) + 1;
+                uint64_t idSorteio = globalSorteios.fetch_add(1, memory_order_relaxed) + 1;
 
                 for (int i = 0; i < 60; ++i) pool[i] = i + 1;
 
-                // Amostragem parcial tipo Fisher-Yates
                 for (int i = 0; i < 6; ++i) {
                     uint32_t idx = rng.next_range(60 - i);
                     bilhete[i] = pool[idx];
@@ -157,9 +170,8 @@ int main() {
                 sort(bilhete.begin(), bilhete.end());
 
                 int idxCombinacao = bilheteParaIndice(bilhete);
-                uint8_t count = historico[idxCombinacao].fetch_add(1, memory_order_relaxed) + 1;
+                uint16_t count = historico[idxCombinacao].fetch_add(1, memory_order_relaxed) + 1;
 
-                // Formatação local acumulada em lote (Batching de E/S)
                 localBuffer += "Bilhete " + to_string(idSorteio) + ": [ ";
                 for (int num : bilhete) {
                     if (num < 10) localBuffer += '0';
@@ -167,7 +179,6 @@ int main() {
                 }
                 localBuffer += "]\n";
 
-                // Descarrega o buffer local para a thread de I/O a cada 64 linhas
                 if (localBuffer.size() >= 3072) {
                     printer.push(move(localBuffer));
                     localBuffer.clear();
